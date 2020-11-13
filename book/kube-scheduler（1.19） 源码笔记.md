@@ -331,4 +331,81 @@ func (p *PriorityQueue) flushUnschedulableQLeftover() {
    }
 }
 ```
+## SchedulerCache 核心源码实现
+
+### schedulerCache 
+
+为什么需要 Scheduler Cache ? 这里的Cache主要用来收集Pod和Node级别的信息，便于Generic Scheduler在调度时高效的查询。
+
+```go
+type schedulerCache struct {
+	stop   <-chan struct{}
+	ttl    time.Duration
+	period time.Duration
+
+	// This mutex guards all fields within this cache struct.
+  // 读写锁确保读多写少场景下数据的安全
+	mu sync.RWMutex
+  
+	// a set of assumed pod keys.
+	// The key could further be used to get an entry in podStates.
+  // 主要用来存储已经被调度器分配节点的pod
+	assumedPods map[string]bool
+  
+	// a map from pod key to podState.
+  // 存储pod对应的状态，状态主要包括 pod *v1.Pod、deadline *time.Time、bindingFinished bool
+  // pod ，当前 pod 对应的配置信息
+  // deadline ，用于记录 pod 过期时间，超过改时间点讲由cleanupAssumedPods删除
+  // bindingFinished，标记当前pod是否被绑定中，如果false则说明还没完成绑定节点
+	podStates map[string]*podState
+  
+  // 使用双向链表的形式存储节点的映射关系
+  // 如果有节点信息发生更新，将会将节点信息放到链表表头
+  // 越靠前的节点越是最新更新的节点
+	nodes     map[string]*nodeInfoListItem
+  
+	// headNode points to the most recently updated NodeInfo in "nodes". It is the
+	// head of the linked list.
+  // headNode 指向当前👆 nodes 中最新更新的节点信息，即双向链表中最前面的节点
+	headNode *nodeInfoListItem
+  
+  // nodeTree是一个树状数据结构，在每个区域中保存节点名称。 
+  //目的是用于节点打散。节点打散主要是指的调度器调度的时候，在满足调度需求的情况下，为了保证pod均匀分配到所有的node节点上，通常会按照逐个zone逐个node节点进行分配，从而让pod节点打散在整个集群中。
+	nodeTree *nodeTree
+  
+	// A map from image name to its imageState.
+  // 用于存储镜像信息，包括镜像大小、存在该镜像的节点名称
+	imageStates map[string]*imageState
+}
+```
+
+###Pod状态
+
+Cache的操作都是以Pod为中心的，对于每次Pod Events，Cache会做递增式update，下面是Cache的状态机。
+
+```go
+// State Machine of a pod's events in scheduler's cache
+//   +-------------------------------------------+  +----+
+//   |                            Add            |  |    |
+//   |                                           |  |    | Update
+//   +      Assume                Add            v  v    |
+//Initial +--------> Assumed +------------+---> Added <--+
+//   ^                +   +               |       +
+//   |                |   |               |       |
+//   |                |   |           Add |       | Remove
+//   |                |   |               |       |
+//   |                |   |               +       |
+//   +----------------+   +-----------> Expired   +----> Deleted
+//         Forget             Expire
+```
+
+这里有几个Event需要解释
+
+- Assume：assumes a pod scheduled and aggregates the pod’s information into its node
+- Forget：removes an assumed pod from cache
+- Expire：After expiration, its information would be subtracted
+- Add：either confirms a pod if it’s assumed, or adds it back if it’s expired
+- Update：removes oldPod’s information and adds newPod’s information
+- Remove：removes a pod. The pod’s information would be subtracted from assigned node.
+
 
