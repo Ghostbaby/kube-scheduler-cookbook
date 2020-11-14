@@ -399,7 +399,7 @@ Cache的操作都是以Pod为中心的，对于每次Pod Events，Cache会做递
 //         Forget             Expire
 ```
 
-这里有几个Event需要解释
+Pod 事件：
 
 - Assume：assumes a pod scheduled and aggregates the pod’s information into its node
 - Forget：removes an assumed pod from cache
@@ -408,4 +408,249 @@ Cache的操作都是以Pod为中心的，对于每次Pod Events，Cache会做递
 - Update：removes oldPod’s information and adds newPod’s information
 - Remove：removes a pod. The pod’s information would be subtracted from assigned node.
 
+与此同时还对应有Pod的几种状态，其中 Initial、Expired、Deleted这三种状态的Pod在Cache中实际上是不存在的，这里只是为了状态机的表示方便。
+关于这几个状态的改变，有一个具体的实现结构体，主要是通过 podState 和 assumedPods 这两个map的状态来实现的。
 
+![kube-scheduler-SchedulerCache](../image/kube-scheduler-SchedulerCache.jpg)
+
+Pod 状态:
+
+- Initial：该状态为虚拟状态，默认情况下将没有调度的 Pod 都任务是处于该状态
+- Assumed：当 Pod 调度成功且分配绑定节点之后，Pod 将会被加入到 assumedPod 队列中，该队列中 Pod 就处于 Assumed 状态
+- Added：当有新 Pod Informer 事件触发，有三种情况 Pod 会进入 Added 状态:
+  - 新建的 Pod 不存在于 cache.podStates 和 assumedPods 中。
+  - 当前 Pod 处于 assumedPods 队列中，但是当前 Pod 真实分配 Node 和 assumedPods 中 Pod 分配的 Node 不一致，会被从 assumedPods 队列中移除，重新加入到 cache.podStates 队列。
+  - 有可能之前 Pod 已经过期从 assumedPods 队列中移除，也会被重新加入到 cache.podStates 队列。
+
+```go
+// 该方法为 podInformer Added 事件的 Handler，即当有 Pod 被新建的时候，会执行该方法
+func (cache *schedulerCache) AddPod(pod *v1.Pod) error {
+   key, err := framework.GetPodKey(pod)
+   if err != nil {
+      return err
+   }
+
+   cache.mu.Lock()
+   defer cache.mu.Unlock()
+
+   currState, ok := cache.podStates[key]
+   switch {
+     // 如果该 Pod 同时存在于 cache.podStates 和 cache.assumedPods 两个队列中时
+   case ok && cache.assumedPods[key]:
+     // 判断实际 Pod 和 cache 中 Pod 的 Spec.NodeName 字段是否一致
+      if currState.pod.Spec.NodeName != pod.Spec.NodeName {
+         // The pod was added to a different node than it was assumed to.
+         klog.Warningf("Pod %v was assumed to be on %v but got added to %v", key, pod.Spec.NodeName, currState.pod.Spec.NodeName)
+         // Clean this up.
+        // 如果 Spec.NodeName 字段不一致， 则需要从 cache.podStates 队列中删除该 Pod
+         if err = cache.removePod(currState.pod); err != nil {
+            klog.Errorf("removing pod error: %v", err)
+         }
+        // 重新添加该 Pod 到 cache.podStates 队列中
+         cache.addPod(pod)
+      }
+     // 这里我们认定，Pod 不应该被 assume 两次，所以此处需要将该 Pod 从 assumedPods 中删除，进行重新调度
+      delete(cache.assumedPods, key)
+      cache.podStates[key].deadline = nil
+      cache.podStates[key].pod = pod
+   case !ok:
+      // Pod was expired. We should add it back.
+      cache.addPod(pod)
+      ps := &podState{
+         pod: pod,
+      }
+      cache.podStates[key] = ps
+   default:
+      return fmt.Errorf("pod %v was already in added state", key)
+   }
+   return nil
+}
+```
+
+- Expired：finishBinding 之后，会按照 schedulerCache.ttl 设置 Pod 的 deadline 时间，scheduler 在启动时会启动一个 groutie 每 cleanAssumedPeriod = 1 * time.Second 时间执行一次 cleanupExpiredAssumedPods ，会从 assumedPods 和 cache.podStates 队列中清除过期的 Pod
+
+```go
+func (cache *schedulerCache) run() {
+  // 启动协程每1秒执行清理过期 Pod 操作
+   go wait.Until(cache.cleanupExpiredAssumedPods, cache.period, cache.stop)
+}
+
+func (cache *schedulerCache) cleanupExpiredAssumedPods() {
+   cache.cleanupAssumedPods(time.Now())
+}
+
+// cleanupAssumedPods exists for making test deterministic by taking time as input argument.
+// It also reports metrics on the cache size for nodes, pods, and assumed pods.
+func (cache *schedulerCache) cleanupAssumedPods(now time.Time) {
+   cache.mu.Lock()
+   defer cache.mu.Unlock()
+   defer cache.updateMetrics()
+
+   // The size of assumedPods should be small
+   for key := range cache.assumedPods {
+     // 从 assumedPods 中读取 Pod
+      ps, ok := cache.podStates[key]
+      if !ok {
+         klog.Fatal("Key found in assumed set but not in podStates. Potentially a logical error.")
+      }
+     // 判断是否完成绑定，如果没有完成绑定则退出清理
+      if !ps.bindingFinished {
+         klog.V(5).Infof("Couldn't expire cache for pod %v/%v. Binding is still in progress.",
+            ps.pod.Namespace, ps.pod.Name)
+         continue
+      }
+     // 如果 Pod 已经过期
+      if now.After(*ps.deadline) {
+         klog.Warningf("Pod %s/%s expired", ps.pod.Namespace, ps.pod.Name)
+        // 执行过期操作
+         if err := cache.expirePod(key, ps); err != nil {
+            klog.Errorf("ExpirePod failed for %s: %v", key, err)
+         }
+      }
+   }
+}
+
+func (cache *schedulerCache) expirePod(key string, ps *podState) error {
+  // 从 NodeInfo 中删除该 Pod ，主要涉及清理 NodeInfo 中 podWithAffinity、podWithRequiredAntiAffinity、Pods 等数据结构
+   if err := cache.removePod(ps.pod); err != nil {
+      return err
+   }
+  // 从 assumedPods 中删除该 Pod
+   delete(cache.assumedPods, key)
+  // 从 podStates 中删除该 Pod
+   delete(cache.podStates, key)
+   return nil
+}
+```
+
+在Cache的调度过程中，我们有以下几个假设:
+
+- Pod是不会被Assume两次的
+- 一个Pod可能会直接被Add而不经过scheduler，这种情况下，我们只会看见Add Event而不会看见Assume Event
+- 如果一个Pod没有被Add过，那么他不会被Remove或者Update
+- `Expired`和`Deleted`都是有效的最终状态。
+
+### Node状态
+
+在Cache中，Node通过双向链表的形式保存信息：
+
+```go
+// nodeInfoListItem holds a NodeInfo pointer and acts as an item in a doubly
+// linked list. When a NodeInfo is updated, it goes to the head of the list.
+// The items closer to the head are the most recently updated items.
+type nodeInfoListItem struct {
+   info *framework.NodeInfo
+   next *nodeInfoListItem
+   prev *nodeInfoListItem
+}
+```
+
+其中，`NodeInfo`保存的信息如下所示，包含了和Node相关的一系列信息。
+
+```go
+// NodeInfo is node level aggregated information.
+type NodeInfo struct {
+   // Overall node information.
+   node *v1.Node
+
+   // Pods running on the node.
+   Pods []*PodInfo
+
+   // The subset of pods with affinity.
+   PodsWithAffinity []*PodInfo
+
+   // The subset of pods with required anti-affinity.
+   PodsWithRequiredAntiAffinity []*PodInfo
+
+   // Ports allocated on the node.
+   UsedPorts HostPortInfo
+
+   // Total requested resources of all pods on this node. This includes assumed
+   // pods, which scheduler has sent for binding, but may not be scheduled yet.
+   Requested *Resource
+   // Total requested resources of all pods on this node with a minimum value
+   // applied to each container's CPU and memory requests. This does not reflect
+   // the actual resource requests for this node, but is used to avoid scheduling
+   // many zero-request pods onto one node.
+   NonZeroRequested *Resource
+   // We store allocatedResources (which is Node.Status.Allocatable.*) explicitly
+   // as int64, to avoid conversions and accessing map.
+   Allocatable *Resource
+
+   // ImageStates holds the entry of an image if and only if this image is on the node. The entry can be used for
+   // checking an image's existence and advanced usage (e.g., image locality scheduling policy) based on the image
+   // state information.
+   ImageStates map[string]*ImageStateSummary
+
+   // TransientInfo holds the information pertaining to a scheduling cycle. This will be destructed at the end of
+   // scheduling cycle.
+   // TODO: @ravig. Remove this once we have a clear approach for message passing across predicates and priorities.
+   TransientInfo *TransientSchedulerInfo
+
+   // Whenever NodeInfo changes, generation is bumped.
+   // This is used to avoid cloning it if the object didn't change.
+   Generation int64
+}
+```
+
+在上面的 `schedulerCache` 中通过 `nodes` 这个 map 和 `headNode`这个指针可以很快的访问Node相关信息。
+
+#### nodeInfo 更新
+
+当收到informer通知，知道集群Node信息发生改变时，会更新Cache中的Node信息。
+
+```go
+Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc:    sched.addPodToCache,
+				UpdateFunc: sched.updatePodInCache,
+				DeleteFunc: sched.deletePodFromCache,
+			},
+```
+
+这里的`add`、`update`、`delete`会分别调用Cache的 `AddNode`、`UpdateNode`和 `RemoveNode`等函数。以 `AddNode`为例：
+
+```go
+func (cache *schedulerCache) AddNode(node *v1.Node) error {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	n, ok := cache.nodes[node.Name]
+	if !ok {
+		n = newNodeInfoListItem(framework.NewNodeInfo())
+		cache.nodes[node.Name] = n
+	} else {
+		cache.removeNodeImageStates(n.info.Node())
+	}
+	cache.moveNodeInfoToHead(node.Name)
+
+	cache.nodeTree.addNode(node)
+	cache.addNodeImageStates(node, n.info)
+	return n.info.SetNode(node)
+}
+```
+
+- 根据需要可以创建新的 NodeInfo 结构体，并且插入到双向链表中。
+- 每次更新Cache中的Node信息时，会将该Node移动到链表头。
+- 同时会更新 `NodeTree` 和 `NodeImageStates`中的信息。
+
+####nodeTree
+
+在Cache中还有一个`NodeTree`的指针用一个树形结构体保存Node的相关信息，目的是用于节点打散。节点打散主要是指的调度器调度的时候，在满足调度需求的情况下，为了保证pod均匀分配到所有的node节点上，通常会按照逐个zone逐个node节点进行分配，从而让pod节点打散在整个集群中。
+
+`NodeTree`的结构如下所示，NodeTree的tree是一个字典，key是zone的名字，value是一个nodeArray，通过这样可以把不同zone的Node分隔开。nodeArray负责存储一个zone下面的所有node节点，并且通过lastIndex记录当前zone分配的节点索引。
+
+```go
+type nodeTree struct {
+	tree      map[string]*nodeArray // a map from zone (region-zone) to an array of nodes in the zone.
+	zones     []string              // a list of all the zones in the tree (keys)
+	zoneIndex int
+	numNodes  int
+}
+
+type nodeArray struct {
+	nodes     []string
+	lastIndex int
+}
+```
+
+![kube-scheduler-node-tree](../image/kube-scheduler-node-tree.png)
