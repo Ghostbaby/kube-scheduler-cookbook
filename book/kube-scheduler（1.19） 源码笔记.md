@@ -399,7 +399,7 @@ Cache的操作都是以Pod为中心的，对于每次Pod Events，Cache会做递
 //         Forget             Expire
 ```
 
-Pod 事件：
+#### Pod 事件
 
 - Assume：assumes a pod scheduled and aggregates the pod’s information into its node
 - Forget：removes an assumed pod from cache
@@ -413,7 +413,7 @@ Pod 事件：
 
 ![kube-scheduler-SchedulerCache](../image/kube-scheduler-SchedulerCache.jpg)
 
-Pod 状态:
+#### Pod 状态
 
 - Initial：该状态为虚拟状态，默认情况下将没有调度的 Pod 都任务是处于该状态
 - Assumed：当 Pod 调度成功且分配绑定节点之后，Pod 将会被加入到 assumedPod 队列中，该队列中 Pod 就处于 Assumed 状态
@@ -467,7 +467,7 @@ func (cache *schedulerCache) AddPod(pod *v1.Pod) error {
 }
 ```
 
-- Expired：finishBinding 之后，会按照 schedulerCache.ttl 设置 Pod 的 deadline 时间，scheduler 在启动时会启动一个 groutie 每 cleanAssumedPeriod = 1 * time.Second 时间执行一次 cleanupExpiredAssumedPods ，会从 assumedPods 和 cache.podStates 队列中清除过期的 Pod
+- Expired：Cache要定时将之前在经过本地scheduler分配完成后的假设的pod的信息进行清理，如果这些pod在给定时间内仍然没有感知到对应的pod真正的添加事件则就这些pod删除。finishBinding 之后，会按照 schedulerCache.ttl 设置 Pod 的 deadline 时间，scheduler 在启动时会启动一个 groutie 每 cleanAssumedPeriod = 1 * time.Second 时间执行一次 cleanupExpiredAssumedPods ，会从 assumedPods 和 cache.podStates 队列中清除过期的 Pod
 
 ```go
 func (cache *schedulerCache) run() {
@@ -595,7 +595,7 @@ type NodeInfo struct {
 
 在上面的 `schedulerCache` 中通过 `nodes` 这个 map 和 `headNode`这个指针可以很快的访问Node相关信息。
 
-#### nodeInfo 更新
+#### nodeInfo
 
 当收到informer通知，知道集群Node信息发生改变时，会更新Cache中的Node信息。
 
@@ -654,3 +654,233 @@ type nodeArray struct {
 ```
 
 ![kube-scheduler-node-tree](../image/kube-scheduler-node-tree.png)
+
+##### 添加node
+
+添加node其实很简单，只需要获取对应node的zone信息，然后加入对应zone的nodeArray中
+
+```go
+// addNode adds a node and its corresponding zone to the tree. If the zone already exists, the node
+// is added to the array of nodes in that zone.
+func (nt *nodeTree) addNode(n *v1.Node) {
+  // 获取当前节点zone信息，主要会检查两个标签：failure-domain.beta.kubernetes.io/zone、topology.kubernetes.io/zone
+  // 按照顺序校验上述两个labels 是否存在，如果不存在则返回""
+   zone := utilnode.GetZoneKey(n)
+   if na, ok := nt.tree[zone]; ok {
+      for _, nodeName := range na.nodes {
+         if nodeName == n.Name {
+            klog.Warningf("node %q already exist in the NodeTree", n.Name)
+            return
+         }
+      }
+     // 将节点加入到已经存在的zone中
+      na.nodes = append(na.nodes, n.Name)
+   } else {
+     // 如果zone不存在，则新建一个zone，并将node加入到对应的zone中。
+      nt.zones = append(nt.zones, zone)
+      nt.tree[zone] = &nodeArray{nodes: []string{n.Name}, lastIndex: 0}
+   }
+   klog.V(2).Infof("Added node %q in group %q to NodeTree", n.Name, zone)
+   nt.numNodes++
+}
+```
+
+##### 数据打散算法
+
+![665f5d51ad30466ba0e9c365d4a7e8cb](/Users/zhuhuijun/Documents/kube-scheduler/665f5d51ad30466ba0e9c365d4a7e8cb.jpg)
+
+数据打散算法，首先我们存储了zone和nodeArray的信息，然后我们只需要通过两个索引zoneIndex和nodeIndex就可以实现节点的打散操作， 只有当当前集群中所有zone里面的所有节点都进行一轮分配后，然后重建分配索引.
+
+```go
+// next returns the name of the next node. NodeTree iterates over zones and in each zone iterates
+// over nodes in a round robin fashion.
+func (nt *nodeTree) next() string {
+   if len(nt.zones) == 0 {
+      return ""
+   }
+  // 用于记录已经分配过的zone个数，用于进行状态重置
+  // 当该值等于zone个数时，将会从头开始分配
+   numExhaustedZones := 0
+   for {
+     // 如果当前zoneIndex 大于等于 zone 的个数，从头开始重新分配
+      if nt.zoneIndex >= len(nt.zones) {
+         nt.zoneIndex = 0
+      }
+     
+     // 获取当前zoneIndex指向zone 信息，按照zone索引进行逐个分配
+      zone := nt.zones[nt.zoneIndex]
+     // zoneIndex 自增
+      nt.zoneIndex++
+      // We do not check the exhausted zones before calling next() on the zone. This ensures
+      // that if more nodes are added to a zone after it is exhausted, we iterate over the new nodes.
+     	// 返回当前zone下面的next节点,如果exhausted为True则表明当前zone所有的节点，在这一轮调度中都已经分配了一次
+      // 就需要从下个zone继续获取节点
+      nodeName, exhausted := nt.tree[zone].next()
+      if exhausted {
+         numExhaustedZones++
+         if numExhaustedZones >= len(nt.zones) { // all zones are exhausted. we should reset.
+            nt.resetExhausted()
+         }
+      } else {
+         return nodeName
+      }
+   }
+}
+```
+
+###Snapshot
+
+当scheduler获取一个待调度的pod，则需要从Cache中获取当前集群中的快照数据(当前此时集群中node的统计信息)，用于后续调度流程中使用。
+
+```go
+// Snapshot is a snapshot of cache NodeInfo and NodeTree order. The scheduler takes a
+// snapshot at the beginning of each scheduling cycle and uses it for its operations in that cycle.
+type Snapshot struct {
+   // nodeInfoMap a map of node name to a snapshot of its NodeInfo.
+   nodeInfoMap map[string]*framework.NodeInfo
+   // nodeInfoList is the list of nodes as ordered in the cache's nodeTree.
+   nodeInfoList []*framework.NodeInfo
+   // havePodsWithAffinityNodeInfoList is the list of nodes with at least one pod declaring affinity terms.
+   havePodsWithAffinityNodeInfoList []*framework.NodeInfo
+   // havePodsWithRequiredAntiAffinityNodeInfoList is the list of nodes with at least one pod declaring
+   // required anti-affinity terms.
+   havePodsWithRequiredAntiAffinityNodeInfoList []*framework.NodeInfo
+  
+  // generation 主要标记当前 snapshot 迭代版本号，后续会被用来比对 NodeInfo 中的 Generation ，确认 NodeInfo 是否需要更新
+   generation                                   int64
+}
+```
+
+#### Snapshot的创建与更新
+
+创建主要位于kubernetes/pkg/scheduler/core/generic_scheduler.go，实际上就是创建一个空的snapshot对象
+
+```
+nodeInfoSnapshot:         framework.NodeInfoSnapshot(),
+```
+
+数据的更新则是通过snapshot方法来调用Cache的更新接口来进行更新
+
+```
+func (g *genericScheduler) snapshot() error {
+    // Used for all fit and priority funcs.
+    return g.cache.UpdateNodeInfoSnapshot(g.nodeInfoSnapshot)
+}
+```
+
+#### 借助headNode实现增量标记
+
+随着集群中node和pod的数量的增加，如果每次都全量获取snapshot则会严重影响调度器的调度效率，在Cache中通过一个双向链表和node的递增计数(etcd实现)来实现增量更新。
+
+```go
+// UpdateSnapshot takes a snapshot of cached NodeInfo map. This is called at
+// beginning of every scheduling cycle.
+// The snapshot only includes Nodes that are not deleted at the time this function is called.
+// nodeinfo.Node() is guaranteed to be not nil for all the nodes in the snapshot.
+// This function tracks generation number of NodeInfo and updates only the
+// entries of an existing snapshot that have changed after the snapshot was taken.
+func (cache *schedulerCache) UpdateSnapshot(nodeSnapshot *Snapshot) error {
+  // 锁定 schedulerCache 对象
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+  // 开启特性 BalanceAttachedNodeVolumes ，该特性主要要在调度时进行平衡资源分配的节点上的卷数。scheduler 在决策时会优先考虑 CPU、内存利用率和卷数更近的节点
+	balancedVolumesEnabled := utilfeature.DefaultFeatureGate.Enabled(features.BalanceAttachedNodeVolumes)
+
+	// Get the last generation of the snapshot.
+	// 获取最近一次 snapshot 的 generation
+	snapshotGeneration := nodeSnapshot.generation
+
+	// NodeInfoList and HavePodsWithAffinityNodeInfoList must be re-created if a node was added
+	// or removed from the cache.
+  // updateAllLists 用于标记 NodeInfoList 和 HavePodsWithAffinityNodeInfoList 两个链表是否需要更新。
+  // 当有节点从缓存中新增或者移除时，前面说的两个链表都需要更新。
+	updateAllLists := false
+	// HavePodsWithAffinityNodeInfoList must be re-created if a node changed its
+	// status from having pods with affinity to NOT having pods with affinity or the other
+	// way around.
+	updateNodesHavePodsWithAffinity := false
+	// HavePodsWithRequiredAntiAffinityNodeInfoList must be re-created if a node changed its
+	// status from having pods with required anti-affinity to NOT having pods with required
+	// anti-affinity or the other way around.
+	updateNodesHavePodsWithRequiredAntiAffinity := false
+
+	// Start from the head of the NodeInfo doubly linked list and update snapshot
+	// of NodeInfos updated after the last snapshot.
+  // 遍历整个 cache.nodes 堆栈，从 doubly linked list 拿到 headNode，并遍历整个堆栈
+	for node := cache.headNode; node != nil; node = node.next {
+    // 如果所有节点全部更新，则退出
+		if node.info.Generation <= snapshotGeneration {
+			// all the nodes are updated before the existing snapshot. We are done.
+			break
+		}
+    // 如果 BalanceAttachedNodeVolumes 特性打开且TransientInfo不为空，则执行 TransientInfo 重置操作。TransientInfo，它由在一个调度周期内有效的项组成，用于在预选和优选之间传递消息，数据主要包含比如节点上正在使用的卷数（RequestedVolumes），可以附加到节点卷的数量（AllocatableVolumesCount）。
+		if balancedVolumesEnabled && node.info.TransientInfo != nil {
+			// Transient scheduler info is reset here.
+			node.info.TransientInfo.ResetTransientSchedulerInfo()
+		}
+    // 获取当前节点信息，如果不存在则退出
+		if np := node.info.Node(); np != nil {
+      // 判断当前节点是否存在于 nodeSnapshot
+			existing, ok := nodeSnapshot.nodeInfoMap[np.Name]
+			if !ok {
+        // 如果不存在，则说明有新的节点加入，我们需要将 updateAllLists 设置 true
+				updateAllLists = true
+        // 为当前节点新建 NodeInfo 对象
+				existing = &framework.NodeInfo{}
+				nodeSnapshot.nodeInfoMap[np.Name] = existing
+			}
+      // 深度复制当前节点信息
+			clone := node.info.Clone()
+			// We track nodes that have pods with affinity, here we check if this node changed its
+			// status from having pods with affinity to NOT having pods with affinity or the other
+			// way around.
+      // 如果当前节点信息 和 缓存中节点信息中带亲和性到容器数量不一致，则将 updateNodesHavePodsWithAffinity 设置为true。
+			if (len(existing.PodsWithAffinity) > 0) != (len(clone.PodsWithAffinity) > 0) {
+				updateNodesHavePodsWithAffinity = true
+			}
+			if (len(existing.PodsWithRequiredAntiAffinity) > 0) != (len(clone.PodsWithRequiredAntiAffinity) > 0) {
+				updateNodesHavePodsWithRequiredAntiAffinity = true
+			}
+			// We need to preserve the original pointer of the NodeInfo struct since it
+			// is used in the NodeInfoList, which we may not update.
+      // 将 snapshot 中该节点信息更新
+			*existing = *clone
+		}
+	}
+	// Update the snapshot generation with the latest NodeInfo generation.
+  // 如果 cache.node 堆栈不为空，则将 `nodeSnapshot` 的 generation 版本设置成  cache.nodes 中最后一个节点的 generation。
+	if cache.headNode != nil {
+		nodeSnapshot.generation = cache.headNode.info.Generation
+	}
+
+	// Comparing to pods in nodeTree.
+	// Deleted nodes get removed from the tree, but they might remain in the nodes map
+	// if they still have non-deleted Pods.
+  // 如果 nodeSnapshot 内节点数量 大于 cache.nodeTree ，则从 nodeSnapshot 中删除不存在的节点，且标记 updateAllLists = true
+	if len(nodeSnapshot.nodeInfoMap) > cache.nodeTree.numNodes {
+		cache.removeDeletedNodesFromSnapshot(nodeSnapshot)
+		updateAllLists = true
+	}
+
+  // 如果 `updateAllLists` 或者 `updateNodesHavePodsWithAffinity` 为真，则从 `nodeInfoMap` 中更新节点到 `nodeInfoList` 和 `havePodsWithAffinityNodeInfoList` 。
+	if updateAllLists || updateNodesHavePodsWithAffinity || updateNodesHavePodsWithRequiredAntiAffinity {
+		cache.updateNodeInfoSnapshotList(nodeSnapshot, updateAllLists)
+	}
+
+  // 如果 `nodeInfoList` 内节点数不等于 `nodeTree` 中节点数，则再次执行全量更新 `nodeInfoList` 和 `havePodsWithAffinityNodeInfoList`。
+	if len(nodeSnapshot.nodeInfoList) != cache.nodeTree.numNodes {
+		errMsg := fmt.Sprintf("snapshot state is not consistent, length of NodeInfoList=%v not equal to length of nodes in tree=%v "+
+			", length of NodeInfoMap=%v, length of nodes in cache=%v"+
+			", trying to recover",
+			len(nodeSnapshot.nodeInfoList), cache.nodeTree.numNodes,
+			len(nodeSnapshot.nodeInfoMap), len(cache.nodes))
+		klog.Error(errMsg)
+		// We will try to recover by re-creating the lists for the next scheduling cycle, but still return an
+		// error to surface the problem, the error will likely cause a failure to the current scheduling cycle.
+		cache.updateNodeInfoSnapshotList(nodeSnapshot, true)
+		return fmt.Errorf(errMsg)
+	}
+
+	return nil
+}
+```
